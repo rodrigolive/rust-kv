@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::fs;
 
 use std::mem;
 use std::sync::{
@@ -69,12 +70,13 @@ type CacheShare = Arc<Mutex<Cache>>;
 type SharedConnection = Arc<Mutex<Connection>>;
 type KVIntoIter = std::collections::hash_map::IntoIter<Key, CntValue>;
 
-#[napi]
-pub struct DualKV {
+#[napi(js_name=RustKV)]
+pub struct RustKV {
     cache: CacheShare,
-    db: SharedConnection,
+    db: Option<SharedConnection>,
     workers: Vec<JoinHandle<()>>,
     should_stop: Arc<AtomicBool>,
+    path: Option<String>,
     iter: Option<KVIntoIter>,
 }
 
@@ -86,7 +88,7 @@ fn db_worker(
     should_stop: Arc<AtomicBool>,
 ) {
     let batch_size: u32 = batch_size.unwrap_or(4000);
-    println!("batch thread started for sqlite with batch {batch_size}");
+    dbg!("batch thread started for sqlite with batch {batch_size}");
 
     let lfu_evict = |c: &Cache, k_evict: usize| {
         c.iter()
@@ -134,7 +136,7 @@ fn db_worker(
         let cache_sz = cache_share.lock().unwrap().deep_size_of();
 
         if cache_sz > max_sz {
-            println!(
+            dbg!(
                 " ••••• cache ram: {} > {}",
                 human(cache_sz as u64),
                 human(max_sz as u64)
@@ -168,7 +170,7 @@ fn db_worker(
             drop(cache);
             let cache = cache_share.lock().unwrap();
             let cache_sz = cache.deep_size_of();
-            println!(
+            dbg!(
                 " :::: evicted {} in {}ms / cache_len: {} :::::: AFTER: {} <=> {}",
                 human(k_evict as u64),
                 t0,
@@ -180,14 +182,14 @@ fn db_worker(
     }
 
     for it in lfu_evict(&(cache_share.lock().unwrap()), 30) {
-        println!("top!! {:?}", it);
+        dbg!("top!! {:?}", it);
     }
 
-    println!("THREAD monitor done.");
+    dbg!("THREAD monitor done.");
 }
 
 #[napi]
-impl DualKV {
+impl RustKV {
     #[napi(constructor)]
     pub fn new(
         max_sz: i64,
@@ -220,10 +222,11 @@ impl DualKV {
 
         Ok(Self {
             iter: None,
+            path: Some(path),
             cache,
             workers,
             should_stop,
-            db: db_shared,
+            db: Some(db_shared),
         })
     }
 
@@ -242,18 +245,23 @@ impl DualKV {
             cv.0 += 1;
             return Ok(Either::A(cv.1.to_owned()));
         } else {
-            let db = self.db.lock().unwrap();
-            let mut stmt = db
-                .prepare_cached("SELECT v,t FROM kv WHERE k=? LIMIT 1")
-                .unwrap();
-            let mut rows = stmt.query(&[&key]).unwrap();
-            match rows.next() {
-                Ok(Some(v)) => {
-                    let value = v.get_unwrap::<_, String>(0);
-                    cache.insert(key.clone(), (1, value.to_owned()));
-                    Ok(Either::A(value))
+            if let Some(db) = &self.db {
+                let db = db.lock().unwrap();
+                let mut stmt = db
+                    .prepare_cached("SELECT v,t FROM kv WHERE k=? LIMIT 1")
+                    .unwrap();
+                let mut rows = stmt.query(&[&key]).unwrap();
+                match rows.next() {
+                    Ok(Some(v)) => {
+                        let value = v.get_unwrap::<_, String>(0);
+                        cache.insert(key.clone(), (1, value.to_owned()));
+                        Ok(Either::A(value))
+                    }
+                    _ => Ok(Either::B(() as Undefined)),
                 }
-                _ => Ok(Either::B(() as Undefined)),
+            }
+            else {
+                Ok(Either::B(() as Undefined))
             }
         }
     }
@@ -412,16 +420,29 @@ impl DualKV {
     }
 
     #[napi(writable = false)]
-    pub fn destroy(&mut self) {
+    pub fn destroy(&mut self, delete_file: bool) {
         self.should_stop.store(true, Ordering::Relaxed);
         while let Some(worker) = self.workers.pop() {
             worker.join().unwrap();
         }
+
+        self.db = None;
+        dbg!("DELETE={:?}", delete_file);
+
+        if delete_file {
+            if let Some(path) = &self.path {
+                if path.len() > 3 {
+                    fs::remove_dir_all(&path).unwrap_or_else(|err| {
+                        panic!("Error removing file {path}: {err}");
+                    });
+                }
+            }
+        }
     }
 }
 
-impl Drop for DualKV {
+impl Drop for RustKV {
     fn drop(&mut self) {
-        self.destroy()
+        self.destroy(false)
     }
 }

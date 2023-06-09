@@ -252,7 +252,7 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { TwoLfu, KvMap } = nativeBinding
+const { RustKV, KvMap } = nativeBinding
 
-module.exports.TwoLfu = TwoLfu
+module.exports.RustKV = RustKV
 module.exports.KvMap = KvMap
